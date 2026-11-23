@@ -5,7 +5,18 @@
 - **定性**：未认证远程代码执行，命令以应用进程权限运行（实验容器内 uid=0）
 - **情报**：已有公开通告与公开复现描述，均未放出 PoC；本包为独立复现
 
-## 一个鉴权缺陷，两个 RCE 出口
+## 怎么选
+
+四条路是同一个鉴权缺陷（`tplPath` 归一化为空）通向的不同写法和执行方式，按需求挑一条即可：
+
+| 你的需求 | 用法 | 出厂镜像实测 |
+|---|---|---|
+| 最快、不留 JSP、不依赖重载，要反复执行不同命令 | `poc-class.py` | 约 3–5 秒，输出直接回显 |
+| 最省事、交互式 | `poc-h2.py`（默认） | 约 10 秒 |
+| 全自动植入，等容器自己重载 | `poc-h2.py --implant` | 约 45 秒 |
+| 只用附件层（对应"覆盖 web.xml 后自动重载"的公开描述） | `poc-attach.py` | 应用由 Tomcat 管理时约 50 秒；官方 ops 镜像需重启 |
+
+## 一个鉴权缺陷，三个 RCE 出口
 
 ```
 ?tplPath=reportlets 归一化为空 → 绕过登录校验（未授权调用上传/apply）
@@ -15,9 +26,12 @@
 │                                    + Tomcat 上下文描述符(容器配置)
 │                                    → autoDeploy 自动重载 → 部署时执行 jspInit
 │                                    （出厂镜像实测：零重启、零触发请求）
-└── 出口二  poc-attach.py            仅靠包内附件清单写毒 WEB-INF/web.xml + x.env(jspInit)
+├── 出口二  poc-attach.py            仅靠包内附件清单写毒 WEB-INF/web.xml + x.env(jspInit)
                                      → Tomcat 发现 web.xml 变了 → 自动重载并执行
                                      （应用需由 Tomcat 自己管理；官方 ops 镜像例外，见下）
+└── 出口三  poc-class.py            附件投递类文件字节 → H2 复制成 WEB-INF/classes/V.class
+                                     → 导入一个 frm 模板, XML 里写 class="V" → FR 解析时实例化 V
+                                     （无需重载、不改 web.xml、不写 JSP；H2 只用于那一次复制）
 ```
 
 "自动重载"的机制：Tomcat 的 `autoDeploy`（出厂默认开启）每隔约 10 秒扫描上下文描述符，
@@ -27,13 +41,17 @@
 附件路线靠的是 Tomcat 的另一条规则：由它自己管理的应用，`WEB-INF/web.xml` 一变就重载——
 只覆盖这一个文件就够了。
 
-## 三种用法与公开描述的对应
+类文件路线靠的是 FR 的另一条规则：解析模板 XML 时，遇到带 `class="…"` 的节点会直接 `newInstance()` 那个类；
+而放进 `WEB-INF/classes` 的新类由类加载器按需加载，不需要重载应用。
+
+## 四种用法与公开描述的对应
 
 | 公开描述里的效果 | 本包对应 | 实测（出厂镜像） |
 |---|---|---|
 | 可控字段进入数据连接流程，连接层的危险参数拦截未生效，命令以应用进程权限执行，结果经 Web 路径回读 | `poc-h2.py`（交互）/ `--shape stealth` | ✓ 约 10 秒出结果 |
 | 导入组件按包内清单写入文件，可写 WEB-INF 甚至覆盖容器配置；容器检测到配置变更后自动重载，代码被解析执行 | `poc-h2.py --implant` | ✓ 描述符写入 3 秒后自动部署，约 45 秒后执行；零重启、零触发请求 |
 | 同上，但只靠附件层完成 | `poc-attach.py` | 应用由 Tomcat 管理时 ✓：写入后 5–8 秒触发重载，约 50–63 秒后执行；官方 ops 镜像的原样 `/webroot` 上只能植入（见"说明与边界"） |
+| 可控内容投递到应用的类加载路径，经无需认证的接口实例化执行，命令以应用进程权限运行 | `poc-class.py` | ✓ 约 3–5 秒出结果，命令输出直接回显；零重载、零 JSP |
 
 ## 文件
 
@@ -41,7 +59,8 @@
 |---|---|
 | `poc-h2.py` | 出口一。交互模式：上传→apply→触发→回读，5 种载荷形态（含 `--shape stealth`）；植入模式 `--implant`：三枪全自动，约 45 秒出结果。纯 Python3 标准库，零依赖 |
 | `poc-attach.py` | 出口二。仅靠附件清单投毒 `web.xml`；应用由 Tomcat 管理时全自动（实测约 50–63 秒），官方 ops 镜像的原样 `/webroot` 上需重启或配合 `--implant` |
-| `vulnerability-analysis.md` | 原理分析：鉴权缺陷、两个出口的反编译实证、H2 判决实验、重载触发实测、修复面 |
+| `poc-class.py` | 出口三。单文件零依赖，内嵌 Java 8 编译的载荷类及其源码；三步 + 一次回读，约 3–5 秒 |
+| `vulnerability-analysis.md` | 原理分析：鉴权缺陷、三个出口的反编译实证、H2 判决实验、重载触发实测、类实例化机制、修复面 |
 | `REPRODUCE.md` | 复现指南：环境、三种打法的命令与期望输出、pcap 导览、常见坑 |
 | `pcaps/` | 三份实录流量：`h2-route.pcap`（交互）、`h2-implant-auto.pcap`（全自动植入）、`attach-route.pcap`（附件全自动） |
 | `waf-variants.md` | 规避变体全集（字符级 + 结构级两层），每个含完整载荷原文与有效/死因，附检测建议 |
@@ -60,6 +79,10 @@ python3 poc-h2.py -t http://<靶场>:18081 --implant -c "id"     # 命令在写�
 
 # 附件层：应用由 Tomcat 管理时全自动；官方 ops 镜像的原样 /webroot 上需先重启或配合 --implant
 python3 poc-attach.py -t http://<靶场>:18081
+
+# 类文件路线：三步 + 回读，输出直接打印；同一目标可反复执行不同命令
+python3 poc-class.py -t http://<靶场>:18081
+python3 poc-class.py -t http://<靶场>:18081 -c "id"
 ```
 
 ## 实测输出（自建靶场）
@@ -106,6 +129,20 @@ uid=0(root) gid=0(root) groups=0(root)
 ----------------------------------------------
 ```
 
+类文件路线（全新纯净容器，全程无重启，耗时 3 秒）：
+
+```
+[1] 落地   -> upload 200 / apply 200 {"applySuccess":true,...}
+[2] 就位   -> upload 200 / apply 200 {"applySuccess":true,...}
+[3] 触发   -> upload 200 / apply 200 {"applySuccess":false,...}   ← 属预期, 见下
+[4] 回显   -> 200  (命令以应用进程权限执行, 输出如下)
+----------------------------------------------
+PWN-CLASS-LOAD
+uid=0(root) gid=0(root) groups=0(root)
+<容器hostname>
+----------------------------------------------
+```
+
 ## 说明与边界
 
 - **路径假设**：PoC 默认按官方镜像布局（`/usr/local/tomcat`、`webapps/webroot`、默认 context 为 ROOT）。
@@ -121,6 +158,11 @@ uid=0(root) gid=0(root) groups=0(root)
   Tomcat 不监听这个应用的 `web.xml`（开 `reloadable` 也只监听 classes/lib，均实测）。所以在这类部署上
   附件层只完成植入，要等重启；`poc-h2.py --implant` 多写一个上下文描述符，应用就转为 Tomcat 管理，
   于是全自动
+- **类文件路线（`poc-class.py`）**：把一个 Java 类放进 `WEB-INF/classes`，再让 FR 解析一个
+  `<Layout class="V"/>` 的 frm 模板把它实例化。不重载、不改 `web.xml`、不写 JSP；类留在目标上，重启后依然在。
+  H2 在这条路线里只做一件事——把已上传的类文件复制进 `classes`（非 H2 的写入口都被检查挡住，
+  见 `vulnerability-analysis.md` §7.3）。第 3 步 apply 返回 `applySuccess=false` 属预期：类在解析阶段
+  已被实例化，之后导入器才报错。载荷是 Java 8 格式，可重复执行不同命令；改了载荷源码要目标重启才会加载新类
 - **JSP-Monitor**：本实验部署里 security.enhance 插件只盯 webroot，写进去的 `.jsp` 秒级被改名
   `.blocked`。所以交互模式写 ROOT，植入模式藏在 WEB-INF 且后缀为 `.env`。监控范围取决于目标配置
 - **FR 功能不受影响**：FR 本体没有自带 `web.xml`（servlet 走注解注册），新写入的不含
@@ -130,7 +172,8 @@ uid=0(root) gid=0(root) groups=0(root)
   Linux 官方镜像时天然满足；Windows 部署需自行改命令形式。FR 进程需对 Tomcat 目录有
   写权限（官方镜像以 root 运行，天然满足）
 - **还原靶场**：删除 `WEB-INF/web.xml`、`WEB-INF/x.env`、`conf/Catalina/localhost/z.xml`
-  （描述符删除后 Tomcat 会在数秒内自动卸载该上下文）、`ROOT/*.jsp`、`webroot/*.txt`
+  （描述符删除后 Tomcat 会在数秒内自动卸载该上下文）、`ROOT/*.jsp`、`webroot/*.txt`，
+  以及类文件路线的 `WEB-INF/classes/V.class`、`WEB-INF/logs/v.txt`、`WEB-INF/logs/c.txt`（删掉后需重启）
 
 ## 免责
 

